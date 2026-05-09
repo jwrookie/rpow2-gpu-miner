@@ -291,6 +291,10 @@ def _batch_attempts(n_threads: int, iters: int) -> int:
     return attempts
 
 
+def _elapsed_ms(start: float) -> float:
+    return (time.perf_counter() - start) * 1000.0
+
+
 def solve(prefix_hex, target_bits, n_threads, iters, attempt_cap):
     """Return (winning_nonce, total_attempts). Raises RuntimeError on cap."""
     if not (1 <= target_bits <= 32):
@@ -521,18 +525,23 @@ def main():
         print(f"using proxy: {proxy}", file=sys.stderr, flush=True)
 
     # Confirm auth before warming up the GPU.
+    t0 = time.perf_counter()
     try:
         status, me = http("GET", "/me", args.cookie)
     except ApiError as e:
         sys.exit(f"auth check failed: {e}")
+    auth_ms = _elapsed_ms(t0)
     if status != 200 or not me or "email" not in me:
         sys.exit(f"unexpected /me response: {me}")
     print(f"signed in: {me['email']}  balance={me['balance_base_units']}",
           file=sys.stderr, flush=True)
+    print(f"[timing] auth /me: {auth_ms:.0f}ms", file=sys.stderr, flush=True)
 
     print("compiling SPIR-V kernel (first launch only)...", file=sys.stderr, flush=True)
+    t0 = time.perf_counter()
     warm_up(args.threads, args.iters, args.pipeline)
-    print("kernel ready.\n", file=sys.stderr, flush=True)
+    warmup_ms = _elapsed_ms(t0)
+    print(f"kernel ready. warmup={warmup_ms:.0f}ms\n", file=sys.stderr, flush=True)
 
     minted = 0
     failures = 0
@@ -562,6 +571,7 @@ def main():
             if args.rounds:
                 want = min(want, args.rounds - minted)
 
+            t0 = time.perf_counter()
             try:
                 with ThreadPoolExecutor(max_workers=want) as pool:
                     futures = [pool.submit(fetch_challenge, args.cookie)
@@ -571,8 +581,15 @@ def main():
                 failures += 1
                 print(f"[!] /challenge failed: {e}", file=sys.stderr, flush=True)
                 continue
+            fetch_ms = _elapsed_ms(t0)
+            unique_challenges = len({ch.get("challenge_id") for ch in challenges})
+            print(
+                f"[timing] challenge batch: requested={want} "
+                f"unique={unique_challenges} fetch={fetch_ms:.0f}ms",
+                file=sys.stderr, flush=True,
+            )
 
-            t0 = time.time()
+            t0 = time.perf_counter()
             try:
                 solutions = solve_batch(
                     challenges, args.threads, args.iters, args.attempt_cap,
@@ -581,8 +598,15 @@ def main():
                 failures += 1
                 print(f"[!] batch solve failed: {e}", file=sys.stderr, flush=True)
                 continue
-            solve_ms = (time.time() - t0) * 1000.0
+            solve_ms = _elapsed_ms(t0)
+            total_attempts = sum(attempts for _nonce, attempts in solutions)
+            print(
+                f"[timing] solve batch: jobs={len(challenges)} "
+                f"attempts={total_attempts:,} solve={solve_ms:.0f}ms",
+                file=sys.stderr, flush=True,
+            )
 
+            t0 = time.perf_counter()
             with ThreadPoolExecutor(max_workers=want) as pool:
                 future_map = {
                     pool.submit(mint_solution, args.cookie, ch, nonce):
@@ -610,20 +634,32 @@ def main():
                             f"attempts={attempts:>10,}  token={token_id}",
                             flush=True,
                         )
+            mint_ms = _elapsed_ms(t0)
+            print(
+                f"[timing] mint batch: submitted={len(solutions)} "
+                f"elapsed={mint_ms:.0f}ms",
+                file=sys.stderr, flush=True,
+            )
             continue
 
+        t0 = time.perf_counter()
         try:
             ch = fetch_challenge(args.cookie)
         except ApiError as e:
             failures += 1
             print(f"[!] /challenge failed: {e}", file=sys.stderr, flush=True)
             continue
+        fetch_ms = _elapsed_ms(t0)
 
         cid    = ch["challenge_id"]
         prefix = ch["nonce_prefix"]
         bits   = ch["difficulty_bits"]
+        print(
+            f"[timing] challenge: id={cid} bits={bits} fetch={fetch_ms:.0f}ms",
+            file=sys.stderr, flush=True,
+        )
 
-        t0 = time.time()
+        t0 = time.perf_counter()
         try:
             nonce, attempts = solve(
                 prefix, bits, args.threads, args.iters, args.attempt_cap,
@@ -633,8 +669,14 @@ def main():
             print(f"[!] solve failed for challenge {cid}: {e}",
                   file=sys.stderr, flush=True)
             continue
-        solve_ms = (time.time() - t0) * 1000.0
+        solve_ms = _elapsed_ms(t0)
+        print(
+            f"[timing] solve: id={cid} attempts={attempts:,} "
+            f"solve={solve_ms:.0f}ms",
+            file=sys.stderr, flush=True,
+        )
 
+        t0 = time.perf_counter()
         try:
             m = mint_solution(args.cookie, ch, nonce)
         except ApiError as e:
@@ -642,6 +684,11 @@ def main():
             print(f"[!] /mint failed (challenge {cid}): {e}",
                   file=sys.stderr, flush=True)
             continue
+        mint_ms = _elapsed_ms(t0)
+        print(
+            f"[timing] mint: id={cid} submit={mint_ms:.0f}ms",
+            file=sys.stderr, flush=True,
+        )
 
         minted += 1
         token_id = (m or {}).get("token", {}).get("id", "?")
