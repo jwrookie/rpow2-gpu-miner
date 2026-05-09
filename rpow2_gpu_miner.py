@@ -570,7 +570,6 @@ def main():
             except ApiError as e:
                 failures += 1
                 print(f"[!] /challenge failed: {e}", file=sys.stderr, flush=True)
-                time.sleep(1.0)
                 continue
 
             t0 = time.time()
@@ -618,7 +617,6 @@ def main():
         except ApiError as e:
             failures += 1
             print(f"[!] /challenge failed: {e}", file=sys.stderr, flush=True)
-            time.sleep(1.0)
             continue
 
         cid    = ch["challenge_id"]
