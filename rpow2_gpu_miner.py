@@ -16,7 +16,7 @@ flags.
 """
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import hashlib
 import json
 import os
@@ -484,6 +484,12 @@ def main():
     p.add_argument("--pipeline", type=int, default=1,
                    help="solve this many outstanding challenges per GPU batch "
                         "(default: 1; try 4-16 if HTTP latency leaves the GPU idle)")
+    p.add_argument("--prefetch", type=int, default=0,
+                   help="when pipeline > 1, keep this many /challenge requests "
+                        "in flight or cached (default: pipeline * 4)")
+    p.add_argument("--mint-workers", type=int, default=0,
+                   help="when pipeline > 1, submit up to this many /mint requests "
+                        "in the background (default: pipeline)")
     p.add_argument("--attempt-cap", type=int, default=1 << 36,
                    help="abort a single PoW after this many attempts (safety)")
     p.add_argument("--proxy", default=DEFAULT_PROXY,
@@ -501,6 +507,10 @@ def main():
         sys.exit("--threads and --iters must be positive")
     if args.pipeline <= 0:
         sys.exit("--pipeline must be positive")
+    if args.prefetch < 0:
+        sys.exit("--prefetch must be non-negative")
+    if args.mint_workers < 0:
+        sys.exit("--mint-workers must be non-negative")
     try:
         _batch_attempts(args.threads, args.iters)
     except ValueError as e:
@@ -548,6 +558,13 @@ def main():
     started_at = time.time()
 
     def stop_summary(*_):
+        try:
+            pools = (challenge_pool, mint_pool)
+        except NameError:
+            pools = ()
+        for pool in pools:
+            if pool:
+                pool.shutdown(wait=False, cancel_futures=True)
         elapsed = time.time() - started_at
         print(file=sys.stderr)
         print("---- summary ----", file=sys.stderr)
@@ -562,32 +579,124 @@ def main():
     signal.signal(signal.SIGINT,  stop_summary)
     signal.signal(signal.SIGTERM, stop_summary)
 
+    pipelined = args.pipeline > 1
+    prefetch_limit = args.prefetch or (args.pipeline * 4)
+    mint_worker_count = args.mint_workers or args.pipeline
+    challenge_pool = None
+    mint_pool = None
+    challenge_futures = set()
+    mint_futures = {}
+    seen_challenge_ids = set()
+    if pipelined:
+        challenge_pool = ThreadPoolExecutor(max_workers=prefetch_limit)
+        mint_pool = ThreadPoolExecutor(max_workers=mint_worker_count)
+        print(
+            f"pipelined mode: pipeline={args.pipeline} "
+            f"prefetch={prefetch_limit} mint_workers={mint_worker_count}",
+            file=sys.stderr, flush=True,
+        )
+
+    def submit_challenge_fetches():
+        while len(challenge_futures) < prefetch_limit:
+            challenge_futures.add(challenge_pool.submit(fetch_challenge, args.cookie))
+
+    def drain_mints(block: bool = False):
+        nonlocal failures, minted
+
+        if not mint_futures:
+            return
+        if block:
+            done, _ = wait(mint_futures, return_when=FIRST_COMPLETED)
+        else:
+            done = {future for future in mint_futures if future.done()}
+        for future in done:
+            ch, _nonce, attempts, solve_ms, submitted_at = mint_futures.pop(future)
+            try:
+                m = future.result()
+            except ApiError as e:
+                failures += 1
+                print(
+                    f"[!] /mint failed (challenge {ch['challenge_id']}): {e}",
+                    file=sys.stderr, flush=True,
+                )
+                continue
+
+            minted += 1
+            mint_ms = _elapsed_ms(submitted_at)
+            token_id = (m or {}).get("token", {}).get("id", "?")
+            print(
+                f"[timing] mint: id={ch['challenge_id']} submit={mint_ms:.0f}ms",
+                file=sys.stderr, flush=True,
+            )
+            if not args.quiet:
+                print(
+                    f"minted #{minted:<5d}  bits={ch['difficulty_bits']}  "
+                    f"batch_solve={solve_ms:>5.0f}ms  "
+                    f"attempts={attempts:>10,}  token={token_id}",
+                    flush=True,
+                )
+
     while True:
-        if args.rounds and minted >= args.rounds:
+        if pipelined:
+            drain_mints()
+            if args.rounds and minted >= args.rounds and not mint_futures:
+                break
+        elif args.rounds and minted >= args.rounds:
             break
 
         if args.pipeline > 1:
+            submit_challenge_fetches()
             want = args.pipeline
             if args.rounds:
-                want = min(want, args.rounds - minted)
+                want = min(want, args.rounds - minted - len(mint_futures))
+                if want <= 0:
+                    drain_mints(block=True)
+                    continue
 
             t0 = time.perf_counter()
-            try:
-                with ThreadPoolExecutor(max_workers=want) as pool:
-                    futures = [pool.submit(fetch_challenge, args.cookie)
-                               for _ in range(want)]
-                    challenges = [future.result() for future in futures]
-            except ApiError as e:
-                failures += 1
-                print(f"[!] /challenge failed: {e}", file=sys.stderr, flush=True)
-                continue
+            challenges = []
+            duplicates = 0
+            fetch_failures = 0
+            while len(challenges) < want:
+                if not challenge_futures:
+                    submit_challenge_fetches()
+                done = {future for future in challenge_futures if future.done()}
+                if not done:
+                    done, _ = wait(challenge_futures, return_when=FIRST_COMPLETED)
+
+                for future in done:
+                    challenge_futures.remove(future)
+                    submit_challenge_fetches()
+                    try:
+                        ch = future.result()
+                    except ApiError as e:
+                        failures += 1
+                        fetch_failures += 1
+                        print(f"[!] /challenge failed: {e}", file=sys.stderr, flush=True)
+                        continue
+
+                    cid = ch.get("challenge_id")
+                    if cid in seen_challenge_ids:
+                        duplicates += 1
+                        continue
+                    seen_challenge_ids.add(cid)
+                    if len(seen_challenge_ids) > 10000:
+                        seen_challenge_ids.clear()
+                    challenges.append(ch)
+                    if len(challenges) >= want:
+                        break
+
             fetch_ms = _elapsed_ms(t0)
             unique_challenges = len({ch.get("challenge_id") for ch in challenges})
             print(
                 f"[timing] challenge batch: requested={want} "
-                f"unique={unique_challenges} fetch={fetch_ms:.0f}ms",
+                f"unique={unique_challenges} duplicates={duplicates} "
+                f"failures={fetch_failures} fetch={fetch_ms:.0f}ms "
+                f"inflight={len(challenge_futures)} pending_mints={len(mint_futures)}",
                 file=sys.stderr, flush=True,
             )
+            if not challenges:
+                continue
 
             t0 = time.perf_counter()
             try:
@@ -607,37 +716,15 @@ def main():
             )
 
             t0 = time.perf_counter()
-            with ThreadPoolExecutor(max_workers=want) as pool:
-                future_map = {
-                    pool.submit(mint_solution, args.cookie, ch, nonce):
-                    (ch, nonce, attempts)
-                    for ch, (nonce, attempts) in zip(challenges, solutions)
-                }
-                for future in as_completed(future_map):
-                    ch, _nonce, attempts = future_map[future]
-                    try:
-                        m = future.result()
-                    except ApiError as e:
-                        failures += 1
-                        print(
-                            f"[!] /mint failed (challenge {ch['challenge_id']}): {e}",
-                            file=sys.stderr, flush=True,
-                        )
-                        continue
-
-                    minted += 1
-                    token_id = (m or {}).get("token", {}).get("id", "?")
-                    if not args.quiet:
-                        print(
-                            f"minted #{minted:<5d}  bits={ch['difficulty_bits']}  "
-                            f"batch_solve={solve_ms:>5.0f}ms  "
-                            f"attempts={attempts:>10,}  token={token_id}",
-                            flush=True,
-                        )
+            for ch, (nonce, attempts) in zip(challenges, solutions):
+                future = mint_pool.submit(mint_solution, args.cookie, ch, nonce)
+                mint_futures[future] = (
+                    ch, nonce, attempts, solve_ms, time.perf_counter(),
+                )
             mint_ms = _elapsed_ms(t0)
             print(
-                f"[timing] mint batch: submitted={len(solutions)} "
-                f"elapsed={mint_ms:.0f}ms",
+                f"[timing] mint batch queued: submitted={len(solutions)} "
+                f"queue={len(mint_futures)} elapsed={mint_ms:.0f}ms",
                 file=sys.stderr, flush=True,
             )
             continue
