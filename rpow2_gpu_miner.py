@@ -499,7 +499,7 @@ def main():
         sys.exit(f"auth check failed: {e}")
     if status != 200 or not me or "email" not in me:
         sys.exit(f"unexpected /me response: {me}")
-    print(f"signed in: {me['email']}  balance={me['balance']}  minted={me['minted']}",
+    print(f"signed in: {me['email']}  balance={me['balance_base_units']}",
           file=sys.stderr, flush=True)
 
     print("compiling SPIR-V kernel (first launch only)...", file=sys.stderr, flush=True)
