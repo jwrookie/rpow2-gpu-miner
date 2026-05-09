@@ -35,6 +35,7 @@ import taichi as ti
 API_BASE = os.environ.get("RPOW_API_BASE", "https://api.rpow2.com")
 ORIGIN = os.environ.get("RPOW_ORIGIN", "https://rpow2.com")
 USER_AGENT = "rpow2-gpu-miner/1.0 (+https://github.com/ImMike/rpow2-gpu-miner)"
+DEFAULT_PROXY = os.environ.get("RPOW_PROXY", "http://127.0.0.1:7890")
 
 
 # --------------------------------------------------------------------------
@@ -45,6 +46,25 @@ class ApiError(Exception):
         super().__init__(f"http {status}: {body}")
         self.status = status
         self.body = body
+
+
+_URL_OPENER = urllib.request.build_opener()
+
+
+def configure_proxy(proxy: str):
+    global _URL_OPENER
+
+    proxy = (proxy or "").strip()
+    if proxy.lower() in ("", "0", "false", "no", "none", "off", "direct"):
+        _URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return None
+
+    if "://" not in proxy:
+        proxy = f"http://{proxy}"
+    _URL_OPENER = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    )
+    return proxy
 
 
 def http(method: str, path: str, cookie: str, body=None, timeout: float = 60.0):
@@ -62,7 +82,7 @@ def http(method: str, path: str, cookie: str, body=None, timeout: float = 60.0):
         f"{API_BASE}{path}", data=data, method=method, headers=headers
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with _URL_OPENER.open(req, timeout=timeout) as r:
             raw = r.read().decode("utf-8")
             return r.status, (json.loads(raw) if raw else None)
     except urllib.error.HTTPError as e:
@@ -462,6 +482,10 @@ def main():
                         "(default: 1; try 4-16 if HTTP latency leaves the GPU idle)")
     p.add_argument("--attempt-cap", type=int, default=1 << 36,
                    help="abort a single PoW after this many attempts (safety)")
+    p.add_argument("--proxy", default=DEFAULT_PROXY,
+                   help="HTTP(S) proxy for API requests "
+                        "(default: $RPOW_PROXY or http://127.0.0.1:7890; "
+                        "use 'off' to connect directly)")
     p.add_argument("--benchmark", type=float, default=0.0,
                    help="run a local GPU benchmark for N seconds and exit "
                         "(does not need a cookie)")
@@ -491,6 +515,10 @@ def main():
     if not args.cookie.startswith("rpow_session="):
         sys.exit("cookie does not start with 'rpow_session='. paste the full "
                  "header value, not just the JWT-looking part.")
+
+    proxy = configure_proxy(args.proxy)
+    if proxy:
+        print(f"using proxy: {proxy}", file=sys.stderr, flush=True)
 
     # Confirm auth before warming up the GPU.
     try:
