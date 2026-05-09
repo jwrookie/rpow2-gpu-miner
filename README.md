@@ -162,6 +162,12 @@ python rpow2_gpu_miner.py --rounds 100
 
 # Quiet mode (only the summary at the end):
 python rpow2_gpu_miner.py --rounds 100 --quiet
+
+# Local GPU-only benchmark, no rpow2 cookie or network needed:
+python rpow2_gpu_miner.py --benchmark 5
+
+# Keep fast GPUs busier by solving several outstanding challenges per batch:
+python rpow2_gpu_miner.py --pipeline 8
 ```
 
 `--help` lists every flag.
@@ -205,6 +211,8 @@ Every nonce the kernel marks as a candidate is independently re-hashed on the CP
 
 The defaults work well from integrated graphics up through high-end discrete cards. If you want to squeeze the last few percent:
 
+- **Measure the kernel without HTTP first.** `python rpow2_gpu_miner.py --benchmark 5` reports local MH/s/GH/s. If this is low, tune `--threads`/`--iters` or check that Vulkan is using the real GPU.
+- **Pipeline live mining when GPU utilization looks idle.** `--pipeline 4`, `--pipeline 8`, or `--pipeline 16` requests several challenges, solves them in one GPU batch, and posts the mints concurrently. This improves average GPU occupancy when each individual PoW is shorter than the HTTP round trip. The default stays `--pipeline 1` for maximum protocol compatibility.
 - **More threads, same iters.** `--threads 4194304 --iters 16` keeps total work the same but flattens the parallel dimension. Helps on cards with high SM/CU count.
 - **More iters, same threads.** `--iters 256` reduces per-launch dispatch overhead. Helps on integrated GPUs where launch latency dominates.
 - **Power efficiency vs latency.** Lower `--threads` reduces tail latency on each PoW; higher `--threads` reduces the number of kernel launches per token at the cost of "wasted" work after a candidate is found.
@@ -218,6 +226,8 @@ for t in 262144 1048576 4194304; do
   done
 done
 ```
+
+If the benchmark shows strong GH/s but live mining still shows near-zero GPU utilization, the bottleneck is not the kernel; use `--pipeline 8` and increase or decrease from there depending on server rate limits.
 
 ---
 
